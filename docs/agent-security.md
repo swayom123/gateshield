@@ -1,0 +1,11 @@
+# Agent identity and sessions
+
+Agent enrollment is disabled unless `GATESHIELD_AGENT_ENROLLMENT_KEY` is configured. A trusted operator enrolls an agent with `POST /v1/agents/enroll`; GateShield returns a random bearer token once and stores only its SHA-256 hash. Enrollment is limited to enabled tools in the configured application and the gateway environment. The enrollment key and agent tokens belong in a secret manager.
+
+Agent model requests must include `agent_id`, `session_id`, and `X-GateShield-Agent-Token`. Non-agent requests can omit all three. GateShield checks token, active status, application/environment binding, and unexpired session before inspection or provider forwarding. Agent fields and credentials are never included in the upstream model payload. Sessions can be started, inspected for signals, and closed through the agent endpoints. The default session lifetime is 30 minutes and can be changed with `GATESHIELD_AGENT_SESSION_TTL_MINUTES`.
+
+Tool proposals and `/v1/tools/authorize` calls are checked against the agent's `allowed_tools`, exact resource assignments where the tool declares a resource argument, and the tool registry. Agent tool authorization must reference the originating persisted gateway `request_id`; its agent and session must match that record. Suspended and revoked agents, expired or closed sessions, unassigned tools, and out-of-scope resources are denied.
+
+Session behavior signals use deterministic counts: repeated policy manipulation, repeated denied actions, unusual tool volume, resource scope expansion attempts, high cumulative session risk, and repeated provider/inspection failures. Thresholds are configurable in each enrolled risk profile. Signals describe observed evidence and do not label an agent malicious. Session tool-volume or cumulative-risk limits suspend that session; operators can inspect signals and manage agent status through the trusted service layer. No signal trains a classifier.
+
+The API is intended to sit behind a trusted application ingress. End-user authentication and administrative RBAC are not implemented. Agent status changes are available through `AgentSecurityService.set_status` for trusted operations code; there is no unauthenticated suspension endpoint. Database-backed counters should use PostgreSQL for concurrent production workloads.
