@@ -1,4 +1,5 @@
 import json
+import asyncio
 import logging
 import re
 import time
@@ -20,19 +21,25 @@ from .agent_security import (
     AgentSessionRequest,
     enrollment_key_matches,
 )
+from .approvals import ApprovalService
+from .classifier import SemanticClassifier
 from .config import get_settings
+from .console import router as console_router
 from .domain import (
     AgentIdentity,
     AgentStatus,
     AIRequest,
+    DataClassification,
     Decision,
     GatewayRequest,
     GatewayResponse,
+    InputFinding,
     InputInspectionResult,
     OutputInspectionResult,
     PolicyDecision,
     RiskLevel,
     SecurityContext,
+    TrustLevel,
 )
 from .inspection import DeterministicInputInspector
 from .output_inspection import DeterministicOutputInspector, validate_response_format
@@ -42,6 +49,7 @@ from .policies import (
     default_policy_definitions,
 )
 from .providers import OpenAICompatibleProvider
+from .routing import assess_model_route
 from .request_guard import RequestSizeLimitMiddleware
 from .storage import (
     RequestRecord,
@@ -51,9 +59,11 @@ from .storage import (
     make_session_factory,
     register_application,
 )
+from .telemetry import configure_tracing, parent_context, stage_span
 from .tool_security import (
     DeterministicToolAuthorizer,
     ToolAuthorizationRequest,
+    ToolAuthorization,
     ToolRegistry,
     ToolSecurityError,
     default_tool_definitions,
@@ -170,21 +180,56 @@ def configure_logging() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+    extra_dlp_detectors = json.loads(settings.extra_dlp_detectors_json)
+    if not isinstance(extra_dlp_detectors, list) or any(
+        not isinstance(name, str) for name in extra_dlp_detectors
+    ):
+        raise ValueError("GATESHIELD_EXTRA_DLP_DETECTORS must be a JSON array of detector names")
+    extra_dlp_detector_set = set(extra_dlp_detectors)
     configure_logging()
-    engine = make_engine(settings.database_url)
+    telemetry_provider = None
+    if settings.opentelemetry_enabled:
+        telemetry_provider = configure_tracing(
+            settings.opentelemetry_endpoint or "",
+            settings.opentelemetry_service_name,
+        )
+    engine = make_engine(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+    )
     if settings.environment == "development":
         await ensure_schema(engine)
     factory = make_session_factory(engine)
     async with factory() as session:
         await register_application(session, settings.application_id, settings.application_name)
     app.state.engine = engine
+    app.state.telemetry_provider = telemetry_provider
     app.state.session_factory = factory
     app.state.policy_repository = PolicyRepository(factory)
     for default_policy in default_policy_definitions():
         await app.state.policy_repository.ensure_default(default_policy)
     app.state.policy_engine = DeterministicPolicyEngine(app.state.policy_repository)
+    app.state.approval_service = ApprovalService(
+        factory,
+        settings.approval_signing_key.get_secret_value() if settings.approval_signing_key else None,
+        settings.approval_ttl_minutes,
+        application_id=settings.application_id,
+        environment=settings.environment,
+        provider_type=settings.provider_type,
+        classification=settings.default_data_classification,
+        routing_mode=settings.model_routing_mode,
+        routes_json=settings.model_routes_json,
+        extra_detectors=frozenset(extra_dlp_detector_set),
+    )
     app.state.input_inspector = DeterministicInputInspector()
-    app.state.output_inspector = DeterministicOutputInspector()
+    app.state.extra_dlp_detectors = frozenset(extra_dlp_detector_set)
+    app.state.output_inspector = DeterministicOutputInspector(extra_dlp_detector_set)
+    app.state.semantic_classifier = SemanticClassifier(
+        settings.semantic_classifier_url,
+        settings.semantic_classifier_timeout_seconds,
+        settings.semantic_classifier_api_key.get_secret_value(),
+    )
     app.state.tool_registry = ToolRegistry(factory)
     for definition in default_tool_definitions():
         await app.state.tool_registry.ensure_default(settings.application_id, definition)
@@ -200,8 +245,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     else:
         app.state.provider = None
-    yield
-    await engine.dispose()
+    try:
+        yield
+    finally:
+        try:
+            if telemetry_provider is not None:
+                await asyncio.to_thread(telemetry_provider.force_flush, 5000)
+                await asyncio.to_thread(telemetry_provider.shutdown)
+        finally:
+            await engine.dispose()
 
 
 app = FastAPI(title="GateShield", version="0.1.0", lifespan=lifespan)
@@ -237,10 +289,27 @@ async def request_ids(request: Request, call_next: RequestResponseEndpoint) -> R
     )
     request.state.request_id = request_id
     request.state.trace_id = trace_id
-    response = await call_next(request)
-    response.headers["x-request-id"] = request_id
-    response.headers["x-trace-id"] = trace_id
-    return response
+    extracted_context = parent_context(request.headers)
+    with stage_span(
+        "gateshield.http.server",
+        context=extracted_context,
+        http_request_method=request.method,
+        http_route=request.url.path,
+        gateshield_request_id=request_id,
+    ) as span:
+        span_context = span.get_span_context()
+        if span_context.is_valid:
+            trace_id = f"{span_context.trace_id:032x}"
+            request.state.trace_id = trace_id
+        response = await call_next(request)
+        response.headers["x-request-id"] = request_id
+        response.headers["x-trace-id"] = trace_id
+        response.headers["x-content-type-options"] = "nosniff"
+        response.headers["x-frame-options"] = "DENY"
+        response.headers["referrer-policy"] = "no-referrer"
+        response.headers["permissions-policy"] = "camera=(), microphone=(), geolocation=()"
+        span.set_attribute("http_response_status_code", response.status_code)
+        return response
 
 
 @app.get("/health")
@@ -253,6 +322,22 @@ async def health(request: Request) -> dict[str, Any]:
     except Exception as exc:
         logger.error("health_check_failed", extra={"event": type(exc).__name__})
         raise HTTPException(status_code=503, detail="Gateway dependency check failed") from exc
+
+
+@app.get("/ready")
+async def readiness(request: Request) -> dict[str, Any]:
+    """Readiness probe for traffic routing; liveness remains available at /health."""
+    try:
+        async with request.app.state.session_factory() as session:
+            await session.execute(text("SELECT 1"))
+        if request.app.state.provider is None:
+            raise HTTPException(status_code=503, detail="Provider is not configured")
+        return {"status": "ready", "database": "ok", "provider": "configured"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("readiness_check_failed", extra={"event": type(exc).__name__})
+        raise HTTPException(status_code=503, detail="Gateway dependencies are not ready") from exc
 
 
 @app.get("/v1/tools")
@@ -333,15 +418,81 @@ async def authorize_tool(
             )
             if session is None:
                 raise HTTPException(status_code=403, detail="Agent session is expired or inactive")
-        authorization = await request.app.state.tool_authorizer.authorize(
-            application_id, body.name, body.arguments, identity
-        )
+        with stage_span(
+            "gateshield.tool.authorize",
+            gateshield_request_id=body.request_id or request.state.request_id,
+            gateshield_application_id=application_id,
+            gateshield_tool_name=body.name,
+        ):
+            authorization = await request.app.state.tool_authorizer.authorize(
+                application_id, body.name, body.arguments, identity
+            )
+        pending_approval_id = None
+        if authorization.decision is Decision.REQUIRE_APPROVAL:
+            if body.approval_id and authorization.definition is not None and body.request_id:
+                consumed = await request.app.state.approval_service.consume(
+                    body.approval_id,
+                    request_id=body.request_id,
+                    agent_id=body.agent_id,
+                    session_id=body.session_id,
+                    tool_name=body.name,
+                    arguments=body.arguments,
+                    target=authorization.normalized_target,
+                    definition=authorization.definition,
+                )
+                if consumed:
+                    authorization = ToolAuthorization(
+                        Decision.ALLOW,
+                        authorization.definition,
+                        authorization.arguments,
+                        "Approval is valid for this exact tool action and was consumed.",
+                        authorization.risk_level,
+                        authorization.normalized_target,
+                    )
+                else:
+                    authorization = ToolAuthorization(
+                        Decision.BLOCK,
+                        authorization.definition,
+                        {},
+                        "Approval is invalid, expired, consumed, or no longer matches the action or policy context.",
+                        authorization.risk_level,
+                        authorization.normalized_target,
+                    )
+            elif body.approval_id:
+                authorization = ToolAuthorization(
+                    Decision.BLOCK,
+                    authorization.definition,
+                    {},
+                    "Scoped approval requires the original persisted request context.",
+                    authorization.risk_level,
+                    authorization.normalized_target,
+                )
+            elif body.request_id and authorization.definition is not None:
+                pending_approval_id = await request.app.state.approval_service.create_pending(
+                    request_id=body.request_id,
+                    agent_id=body.agent_id,
+                    session_id=body.session_id,
+                    tool_name=body.name,
+                    arguments=body.arguments,
+                    target=authorization.normalized_target,
+                    definition=authorization.definition,
+                )
+            else:
+                authorization = ToolAuthorization(
+                    Decision.BLOCK,
+                    authorization.definition,
+                    {},
+                    "High-risk actions require a persisted request ID for scoped approval.",
+                    authorization.risk_level,
+                    authorization.normalized_target,
+                )
         await persist_invocation(
             request.app.state.session_factory,
             application_id=application_id,
             request_id=body.request_id,
             tool_name=body.name,
             authorization=authorization,
+            extra_detectors=request.app.state.extra_dlp_detectors,
         )
         behavior_signals = []
         if identity is not None and session is not None:
@@ -385,6 +536,7 @@ async def authorize_tool(
             "risk_level": authorization.risk_level.value,
             "validated_target": authorization.normalized_target,
             "request_id": body.request_id,
+            "approval_id": pending_approval_id,
             "behavior_signals": [signal.model_dump(mode="json") for signal in behavior_signals],
         },
         headers={"x-request-id": request.state.request_id, "x-trace-id": request.state.trace_id},
@@ -532,6 +684,7 @@ async def chat_completions(
         application_id=settings.application_id,
         environment=settings.environment,
         provider_type=settings.provider_type,
+        data_classification=DataClassification(settings.default_data_classification),
         allowed_models=[body.model],
     )
     agent_identity: AgentIdentity | None = None
@@ -575,7 +728,99 @@ async def chat_completions(
             )
     inspection_result = InputInspectionResult()
     try:
-        inspection_result = await request.app.state.input_inspector.inspect(ai_request, context)
+        with stage_span(
+            "gateshield.input.inspect",
+            gateshield_request_id=request_id,
+            gateshield_application_id=settings.application_id,
+        ):
+            inspection_result = await request.app.state.input_inspector.inspect(ai_request, context)
+        if settings.semantic_classifier_mode != "OFF":
+            try:
+                signal = await request.app.state.semantic_classifier.classify(ai_request)
+                context.semantic_risk_score = signal.risk_score
+                context.semantic_classifier_status = "AVAILABLE"
+                if signal.injection_likely:
+                    threshold = settings.semantic_classifier_enforce_threshold
+                    severity = (
+                        RiskLevel.HIGH if signal.risk_score >= threshold else RiskLevel.MEDIUM
+                    )
+                    inspection_result.findings.append(
+                        InputFinding(
+                            finding_type="SEMANTIC_RISK_SIGNAL",
+                            severity=severity,
+                            message_index=0,
+                            segment_path="semantic_classifier",
+                            source="semantic_classifier",
+                            trust_level=TrustLevel.UNKNOWN,
+                            matched_signal="injection_likely",
+                            evidence={"risk_score": signal.risk_score},
+                        )
+                    )
+                    if (
+                        settings.semantic_classifier_mode == "ENFORCE"
+                        and signal.risk_score >= threshold
+                    ):
+                        context.semantic_enforcement_triggered = True
+                        inspection_result.findings.append(
+                            InputFinding(
+                                finding_type="SEMANTIC_INJECTION_ENFORCED",
+                                severity=RiskLevel.HIGH,
+                                message_index=0,
+                                segment_path="semantic_classifier",
+                                source="semantic_classifier",
+                                trust_level=TrustLevel.UNKNOWN,
+                                matched_signal="injection_likely_above_threshold",
+                                evidence={"risk_score": signal.risk_score, "threshold": threshold},
+                            )
+                        )
+            except Exception as classifier_error:
+                context.semantic_classifier_status = "UNAVAILABLE"
+                inspection_result.findings.append(
+                    InputFinding(
+                        finding_type="SEMANTIC_CLASSIFIER_UNAVAILABLE",
+                        severity=RiskLevel.HIGH
+                        if settings.semantic_classifier_mode == "ENFORCE"
+                        else RiskLevel.MEDIUM,
+                        message_index=0,
+                        segment_path="semantic_classifier",
+                        source="semantic_classifier",
+                        trust_level=TrustLevel.UNKNOWN,
+                        matched_signal="classifier_unavailable",
+                        evidence={"mode": settings.semantic_classifier_mode},
+                    )
+                )
+                logger.warning(
+                    "semantic_classifier_unavailable",
+                    extra={
+                        "request_id": request_id,
+                        "trace_id": trace_id,
+                        "event": type(classifier_error).__name__,
+                    },
+                )
+                if settings.semantic_classifier_mode == "ENFORCE":
+                    denial = PolicyDecision(
+                        decision=Decision.BLOCK,
+                        reason="Semantic enforcement is configured but classifier evaluation failed.",
+                        risk_score=100,
+                        violations=["semantic_classifier_unavailable"],
+                    )
+                    try:
+                        await _persist_block(
+                            request, ai_request, context, denial, started, inspection_result
+                        )
+                    except Exception as persist_error:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Classifier failure audit failed; request was denied",
+                        ) from persist_error
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "detail": denial.reason,
+                            "request_id": request_id,
+                            "trace_id": trace_id,
+                        },
+                    )
         context.message_provenance = inspection_result.provenance
         context.input_findings = inspection_result.findings
         context.prompt_injection_detected = any(
@@ -601,9 +846,14 @@ async def chat_completions(
                 (finding.severity for finding in inspection_result.findings),
                 key=lambda level: list(RiskLevel).index(level),
             )
-        decision: PolicyDecision = await request.app.state.policy_engine.evaluate(
-            ai_request, context
-        )
+        with stage_span(
+            "gateshield.policy.input",
+            gateshield_request_id=request_id,
+            gateshield_application_id=settings.application_id,
+        ):
+            decision: PolicyDecision = await request.app.state.policy_engine.evaluate(
+                ai_request, context
+            )
     except Exception as exc:
         await _record_agent_failure(request, agent_session, request_id, trace_id)
         logger.error(
@@ -638,6 +888,37 @@ async def chat_completions(
             },
         )
 
+    route_decision = assess_model_route(
+        model=body.model,
+        application_id=settings.application_id,
+        environment=settings.environment,
+        classification=context.data_classification.value,
+        provider_type=settings.provider_type,
+        mode=settings.model_routing_mode,
+        routes_json=settings.model_routes_json,
+    )
+    context.model_route_status = route_decision.status
+    context.model_route_reason = route_decision.reason
+    if not route_decision.allowed:
+        route_block = PolicyDecision(
+            decision=Decision.BLOCK,
+            reason=route_decision.reason,
+            matched_policies=decision.matched_policies,
+            risk_score=100 if context.data_classification is DataClassification.RESTRICTED else 75,
+            violations=[f"model_route:{route_decision.status}"],
+        )
+        await _persist_block(request, ai_request, context, route_block, started, inspection_result)
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": route_decision.reason,
+                "request_id": request_id,
+                "trace_id": trace_id,
+            },
+            headers={"x-request-id": request_id, "x-trace-id": trace_id},
+        )
+    if route_decision.status == "MONITOR_MISMATCH" and context.risk_level == RiskLevel.LOW:
+        context.risk_level = RiskLevel.MEDIUM
     safe_tools: list[dict[str, Any]] = []
     if body.tools:
         try:
@@ -674,39 +955,70 @@ async def chat_completions(
         for message in body.messages
     ]
     try:
-        upstream = await provider.complete(provider_payload)
+        with stage_span(
+            "gateshield.provider.request",
+            gateshield_request_id=request_id,
+            gateshield_application_id=settings.application_id,
+            gateshield_model=body.model,
+            gateshield_provider_type=settings.provider_type,
+        ):
+            upstream = await provider.complete(provider_payload)
         response_model = _response_model(upstream)
-        output_inspection = await request.app.state.output_inspector.inspect(
-            response_model, context, getattr(body, "response_format", None)
-        )
-        tool_findings = await request.app.state.tool_authorizer.inspect_completion(
-            settings.application_id,
-            upstream,
-            agent_identity,
-            {
-                tool["function"]["name"]
-                for tool in safe_tools
-                if isinstance(tool.get("function"), dict)
-                and isinstance(tool["function"].get("name"), str)
-            },
-        )
+        with stage_span(
+            "gateshield.output.inspect",
+            gateshield_request_id=request_id,
+            gateshield_application_id=settings.application_id,
+        ):
+            output_inspection = await request.app.state.output_inspector.inspect(
+                response_model, context, getattr(body, "response_format", None)
+            )
+        with stage_span(
+            "gateshield.tool.inspect_completion",
+            gateshield_request_id=request_id,
+            gateshield_application_id=settings.application_id,
+        ):
+            tool_findings = await request.app.state.tool_authorizer.inspect_completion(
+                settings.application_id,
+                upstream,
+                agent_identity,
+                {
+                    tool["function"]["name"]
+                    for tool in safe_tools
+                    if isinstance(tool.get("function"), dict)
+                    and isinstance(tool["function"].get("name"), str)
+                },
+            )
         output_inspection.findings.extend(tool_findings)
+        if tool_findings:
+            context.risk_level = RiskLevel.HIGH
         sensitive_tool_argument = any(
             finding.finding_type == "OUTPUT_SENSITIVE_DATA_DETECTED"
             and ".tool_calls[" in finding.location
             for finding in output_inspection.findings
         )
-        context.tool_security_violation = bool(tool_findings) or sensitive_tool_argument
+        context.tool_security_violation = (
+            any(finding.finding_type == "TOOL_BLOCKED" for finding in tool_findings)
+            or sensitive_tool_argument
+        )
         if agent_identity is not None and agent_session is not None:
             attempts = _tool_call_count(upstream)
-            denied_attempts = min(attempts, len(tool_findings) + int(sensitive_tool_argument))
-            if denied_attempts:
+            denied_attempts = min(
+                attempts,
+                sum(finding.finding_type == "TOOL_BLOCKED" for finding in tool_findings)
+                + int(sensitive_tool_argument),
+            )
+            if attempts:
                 await request.app.state.agent_service.record_tool_activity(
                     agent_session.id,
                     request_id=request_id,
-                    attempts=denied_attempts,
+                    attempts=attempts,
                     denied=denied_attempts,
-                    risk_increment=50 * denied_attempts,
+                    risk_increment=50
+                    * (
+                        attempts
+                        if any(f.finding_type == "APPROVAL_REQUIRED" for f in tool_findings)
+                        else denied_attempts
+                    ),
                     resource_scope_violation=any(
                         finding.finding_type == "TOOL_BLOCKED"
                         and "scope" in str(finding.evidence).lower()
@@ -729,9 +1041,14 @@ async def chat_completions(
         ) from exc
 
     try:
-        output_decision: PolicyDecision = await request.app.state.policy_engine.evaluate(
-            ai_request, context
-        )
+        with stage_span(
+            "gateshield.policy.output",
+            gateshield_request_id=request_id,
+            gateshield_application_id=settings.application_id,
+        ):
+            output_decision: PolicyDecision = await request.app.state.policy_engine.evaluate(
+                ai_request, context
+            )
     except Exception as exc:
         await _record_agent_failure(request, agent_session, request_id, trace_id)
         logger.error(
@@ -864,6 +1181,12 @@ async def chat_completions(
                             "matched_policies": output_decision.matched_policies,
                             "violations": output_decision.violations,
                             "required_actions": output_decision.required_actions,
+                            "semantic_risk_score": context.semantic_risk_score,
+                            "semantic_classifier_status": context.semantic_classifier_status,
+                            "semantic_enforcement_triggered": context.semantic_enforcement_triggered,
+                            "data_classification": context.data_classification.value,
+                            "model_route_status": context.model_route_status,
+                            "model_route_reason": context.model_route_reason,
                             "message_provenance": [
                                 segment.model_dump(mode="json")
                                 for segment in context.message_provenance
@@ -970,6 +1293,12 @@ async def _persist_block(
                         "matched_policies": decision.matched_policies,
                         "violations": decision.violations,
                         "required_actions": decision.required_actions,
+                        "semantic_risk_score": context.semantic_risk_score,
+                        "semantic_classifier_status": context.semantic_classifier_status,
+                        "semantic_enforcement_triggered": context.semantic_enforcement_triggered,
+                        "data_classification": context.data_classification.value,
+                        "model_route_status": context.model_route_status,
+                        "model_route_reason": context.model_route_reason,
                         "message_provenance": [
                             segment.model_dump(mode="json")
                             for segment in context.message_provenance
@@ -1050,6 +1379,12 @@ async def _persist_output_result(
                         "reason": decision.reason,
                         "matched_policies": decision.matched_policies,
                         "violations": decision.violations,
+                        "semantic_risk_score": context.semantic_risk_score,
+                        "semantic_classifier_status": context.semantic_classifier_status,
+                        "semantic_enforcement_triggered": context.semantic_enforcement_triggered,
+                        "data_classification": context.data_classification.value,
+                        "model_route_status": context.model_route_status,
+                        "model_route_reason": context.model_route_reason,
                     }
                 ),
                 outcome="withheld",
@@ -1085,3 +1420,6 @@ def _add_output_finding_events(
                 else "observed",
             )
         )
+
+
+app.include_router(console_router)

@@ -60,6 +60,38 @@ class SecurityEventRecord(Base):
     )
 
 
+class ConsoleAuditRecord(Base):
+    __tablename__ = "console_audit"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    actor: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    target: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+
+class ToolApprovalRecord(Base):
+    __tablename__ = "tool_approvals"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    application_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    request_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    agent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    session_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    scope_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    context_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    arguments_redacted: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    target_redacted: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class PolicyRecord(Base):
     __tablename__ = "policies"
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -163,8 +195,11 @@ class BehaviorSignalRecord(Base):
     )
 
 
-def make_engine(database_url: str) -> AsyncEngine:
-    return create_async_engine(database_url, pool_pre_ping=True)
+def make_engine(database_url: str, *, pool_size: int = 10, max_overflow: int = 20) -> AsyncEngine:
+    options: dict[str, Any] = {"pool_pre_ping": True}
+    if not database_url.startswith("sqlite"):
+        options.update(pool_size=pool_size, max_overflow=max_overflow, pool_recycle=1800)
+    return create_async_engine(database_url, **options)
 
 
 def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

@@ -1,8 +1,11 @@
 import base64
 import binascii
+import html
 import re
+import unicodedata
 from collections.abc import Iterator
 from typing import Any
+from urllib.parse import unquote
 
 from .domain import (
     AIRequest,
@@ -98,7 +101,14 @@ def _text_leaves(value: Any, path: str = "content") -> Iterator[tuple[str, str]]
             yield from _text_leaves(child, f"{path}[{index}]")
     elif isinstance(value, dict):
         for key, child in value.items():
-            yield from _text_leaves(child, f"{path}.{key}")
+            name = str(key)
+            safe_name = (
+                name
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,31}", name)
+                and not re.search(r"(?i)(secret|token|password|credential|api[_-]?key)", name)
+                else "<field>"
+            )
+            yield from _text_leaves(child, f"{path}.{safe_name}")
 
 
 def _mask(value: str) -> str:
@@ -129,13 +139,18 @@ def _direct_injection_matches(text: str) -> Iterator[tuple[str, str]]:
 
 
 def _injection_matches(text: str) -> Iterator[tuple[str, str]]:
+    normalized = unicodedata.normalize("NFKC", html.unescape(unquote(text)))
+    normalized = "".join(
+        char for char in normalized
+        if char not in "\u200b\u200c\u200d\u2060\ufeff\ufe0e\ufe0f"
+    )
     seen: set[str] = set()
-    for signal_id, excerpt in _direct_injection_matches(text):
+    for signal_id, excerpt in _direct_injection_matches(normalized):
         if signal_id not in seen:
             seen.add(signal_id)
             yield signal_id, excerpt
 
-    for candidate_match in BASE64_CANDIDATE.finditer(text):
+    for candidate_match in BASE64_CANDIDATE.finditer(normalized):
         candidate = candidate_match.group(0)
         try:
             decoded_bytes = base64.b64decode(candidate, validate=True)

@@ -1,6 +1,6 @@
 # Deterministic policies
 
-GateShield evaluates validated policy snapshots before provider forwarding. Conditions are exact matches over request and security context fields: application, user, agent, model, environment, provider type, data classification, and whether the request contains tools. There are no arbitrary expressions, regular expressions, or model-based classifiers in the decision path.
+GateShield evaluates validated policy snapshots before provider forwarding and after output inspection. Conditions are typed matches over request and security context fields: application, user, agent, model, environment, provider type, data classification, tool presence, deterministic findings, and semantic risk score. `semantic_risk_min` matches when the collected score is greater than or equal to its threshold. There are no arbitrary expressions or regular expressions in policy definitions. The optional classifier cannot issue an allow decision; the policy engine remains authoritative.
 
 ## Modes
 
@@ -32,5 +32,17 @@ PolicyDefinition(
 ```
 
 Definitions reject unknown fields and empty conditions. The `PolicyRepository` supports draft creation, revision, activation, retirement, history, and rollback. There is no unauthenticated management endpoint; administrative API access belongs with server-side RBAC.
+
+Example classifier triage policy:
+
+```python
+PolicyDefinition(
+    id="triage-high-semantic-risk",
+    description="Block high semantic risk when classifier enforcement is enabled.",
+    effect=Decision.BLOCK,
+    mode=PolicyMode.ENFORCE,
+    conditions=PolicyConditions(semantic_risk_min=85),
+)
+```
 
 Policy evaluation is deterministic and does not call an LLM. If loading or validating active policy data fails, request evaluation raises an error and the gateway denies forwarding.

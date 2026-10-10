@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import re
 from collections.abc import Iterator
 from typing import Any
@@ -22,6 +23,9 @@ MAX_STRUCTURED_OUTPUT_BYTES = 1_048_576
 EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 SSN = re.compile(r"\b(?!000|666|9\d\d)\d{3}[- ]?(?!00)\d{2}[- ]?(?!0000)\d{4}\b")
 CARD = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+US_PHONE = re.compile(r"(?<!\d)(?:\+?1[ .-]?)?(?:\(\d{3}\)|\d{3})[ .-]?\d{3}[ .-]?\d{4}(?!\d)")
+IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+EXTRA_DLP = {"US_PHONE": US_PHONE, "IPV4": IPV4}
 FORBIDDEN_SCHEMA_KEYS = {"$ref", "$dynamicRef", "$recursiveRef"}
 UNBOUNDED_SCHEMA_KEYS = {"pattern", "patternProperties"}
 
@@ -94,15 +98,27 @@ def _has_luhn_checksum(value: str) -> bool:
     return checksum % 10 == 0
 
 
-def _redact_text(text: str) -> tuple[str, list[tuple[str, str]]]:
+def _redact_text(
+    text: str, extra_detectors: frozenset[str] = frozenset()
+) -> tuple[str, list[tuple[str, str]]]:
     output = text
     detected: list[tuple[str, str]] = []
     detectors = [(name, pattern, group) for name, pattern, group in SECRET_SIGNALS]
     detectors.extend([("email_address", EMAIL, 0), ("us_ssn", SSN, 0)])
+    detectors.extend(
+        ("us_phone" if name == "US_PHONE" else "ipv4_address", EXTRA_DLP[name], 0)
+        for name in sorted(extra_detectors)
+    )
     for name, pattern, group in detectors:
 
         def replace(match: re.Match[str], name: str = name, group: int = group) -> str:
             value = match.group(group) if group else match.group(0)
+            if name == "ipv4_address":
+                try:
+                    if ipaddress.ip_address(value).version != 4:
+                        return match.group(0)
+                except ValueError:
+                    return match.group(0)
             detected.append((name, value))
             masked = _mask(value)
             if group:
@@ -122,6 +138,12 @@ def _redact_text(text: str) -> tuple[str, list[tuple[str, str]]]:
 
 
 class DeterministicOutputInspector:
+    def __init__(self, extra_detectors: set[str] | None = None) -> None:
+        self.extra_detectors = frozenset(extra_detectors or set())
+        unsupported = self.extra_detectors - EXTRA_DLP.keys()
+        if unsupported:
+            raise ValueError(f"Unsupported extra DLP detectors: {', '.join(sorted(unsupported))}")
+
     async def inspect(
         self,
         response: GatewayResponse,
@@ -133,7 +155,7 @@ class DeterministicOutputInspector:
             raise ValueError("Upstream response exceeds the inspection size limit")
         findings: list[OutputFinding] = []
         for location, text in _text_locations(sanitized):
-            _, detected = _redact_text(text)
+            _, detected = _redact_text(text, self.extra_detectors)
             for detector, value in detected:
                 findings.append(
                     OutputFinding(
@@ -144,7 +166,7 @@ class DeterministicOutputInspector:
                         evidence={"masked_value": _mask(value)},
                     )
                 )
-        sanitized = _redact_tree(sanitized)
+        sanitized = _redact_tree(sanitized, self.extra_detectors)
         structured_valid: bool | None = None
         validation_error = None
         if response_format is not None:
@@ -179,13 +201,13 @@ class DeterministicOutputInspector:
         )
 
 
-def _redact_tree(value: Any) -> Any:
+def _redact_tree(value: Any, extra_detectors: frozenset[str] = frozenset()) -> Any:
     if isinstance(value, str):
-        return _redact_text(value)[0]
+        return _redact_text(value, extra_detectors)[0]
     if isinstance(value, list):
-        return [_redact_tree(item) for item in value]
+        return [_redact_tree(item, extra_detectors) for item in value]
     if isinstance(value, dict):
-        return {key: _redact_tree(item) for key, item in value.items()}
+        return {key: _redact_tree(item, extra_detectors) for key, item in value.items()}
     return value
 
 

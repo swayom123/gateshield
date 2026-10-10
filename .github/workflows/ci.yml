@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -e '.[dev,observability]'
+      - run: ruff check --select F .
+      - run: ruff check scripts/expire_data.py tests/test_production_hardening.py
+      - run: ruff format --check scripts/expire_data.py tests/test_production_hardening.py
+      - run: mypy gateshield
+      - run: pytest -q
+      - name: Upgrade migrations on SQLite
+        env:
+          GATESHIELD_DATABASE_URL: sqlite+aiosqlite:////tmp/gateshield-ci.db
+        run: alembic upgrade head
+      - name: Dependency vulnerability audit
+        run: |
+          python -m pip install pip-audit
+          pip-audit

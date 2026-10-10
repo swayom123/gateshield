@@ -70,6 +70,7 @@ class ToolAuthorizationRequest(BaseModel):
     request_id: str | None = Field(default=None, max_length=36)
     agent_id: str | None = Field(default=None, max_length=128)
     session_id: str | None = Field(default=None, max_length=36)
+    approval_id: str | None = Field(default=None, max_length=36)
 
 
 def default_tool_definitions() -> tuple[ToolDefinition, ...]:
@@ -531,6 +532,7 @@ async def persist_invocation(
     request_id: str | None,
     tool_name: str,
     authorization: ToolAuthorization,
+    extra_detectors: frozenset[str] = frozenset(),
 ) -> None:
     async with sessions() as session:
         session.add(
@@ -541,7 +543,7 @@ async def persist_invocation(
                 tool_name=tool_name,
                 decision=authorization.decision.value,
                 risk_level=authorization.risk_level.value,
-                arguments_redacted=_redact_arguments(authorization.arguments),
+                arguments_redacted=_redact_arguments(authorization.arguments, extra_detectors),
                 reason=authorization.reason,
                 created_at=datetime.now(UTC),
             )
@@ -549,14 +551,16 @@ async def persist_invocation(
         await session.commit()
 
 
-def _redact_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+def _redact_arguments(
+    arguments: dict[str, Any], extra_detectors: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     sensitive = {"password", "secret", "token", "api_key", "authorization", "credential"}
 
     def clean(value: Any, key: str = "") -> Any:
         if any(term in key.lower() for term in sensitive):
             return "[REDACTED]"
         if isinstance(value, str):
-            return _redact_text(value)[0]
+            return _redact_text(value, extra_detectors)[0]
         if isinstance(value, list):
             return [clean(item) for item in value]
         if isinstance(value, dict):

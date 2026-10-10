@@ -171,6 +171,11 @@ class SecurityContext(BaseModel):
     output_sensitive_data_detected: bool = False
     output_schema_invalid: bool = False
     tool_security_violation: bool = False
+    semantic_risk_score: int = Field(default=0, ge=0, le=100)
+    semantic_classifier_status: str = "OFF"
+    semantic_enforcement_triggered: bool = False
+    model_route_status: str = "UNASSESSED"
+    model_route_reason: str | None = None
     data_classification: DataClassification = DataClassification.INTERNAL
     allowed_tools: list[str] = Field(default_factory=list)
     allowed_models: list[str] = Field(default_factory=list)

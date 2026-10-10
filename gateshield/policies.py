@@ -46,6 +46,8 @@ class PolicyConditions(BaseModel):
     output_sensitive_data_detected: bool | None = None
     output_schema_invalid: bool | None = None
     tool_security_violation: bool | None = None
+    semantic_risk_min: int | None = Field(default=None, ge=0, le=100)
+    semantic_enforcement_triggered: bool | None = None
 
     @model_validator(mode="after")
     def require_match_field(self) -> "PolicyConditions":
@@ -70,11 +72,17 @@ class PolicyConditions(BaseModel):
             "output_sensitive_data_detected": context.output_sensitive_data_detected,
             "output_schema_invalid": context.output_schema_invalid,
             "tool_security_violation": context.tool_security_violation,
+            "semantic_risk_score": context.semantic_risk_score,
+            "semantic_enforcement_triggered": context.semantic_enforcement_triggered,
         }
-        return all(
-            expected is None or values[name] == expected
-            for name, expected in self.model_dump(exclude_none=True).items()
-        )
+        conditions = self.model_dump(exclude_none=True)
+        for name, expected in conditions.items():
+            if name == "semantic_risk_min":
+                if values[name] < expected:
+                    return False
+            elif values[name] != expected:
+                return False
+        return True
 
 
 class PolicyDefinition(BaseModel):
@@ -124,6 +132,13 @@ def default_policy_definitions() -> tuple[PolicyDefinition, ...]:
             effect=Decision.BLOCK,
             mode=PolicyMode.ENFORCE,
             conditions=PolicyConditions(tool_security_violation=True),
+        ),
+        PolicyDefinition(
+            id="default-block-enforced-semantic-injection",
+            description="Block high confidence semantic injection signals when classifier enforcement is enabled.",
+            effect=Decision.BLOCK,
+            mode=PolicyMode.ENFORCE,
+            conditions=PolicyConditions(semantic_enforcement_triggered=True),
         ),
     )
 
@@ -267,7 +282,7 @@ class PolicyRepository:
 
 
 class DeterministicPolicyEngine:
-    """Evaluates exact, typed condition matches; no model classifier is consulted."""
+    """Evaluates typed policy conditions; classifier output is only a policy input signal."""
 
     def __init__(self, repository: PolicyRepository) -> None:
         self.repository = repository

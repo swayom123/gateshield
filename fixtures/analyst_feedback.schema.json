@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GateShield evaluation analyst feedback",
+  "type": "object",
+  "required": ["fixture_set", "fixture_id", "label"],
+  "properties": {
+    "fixture_set": {"type": "string"},
+    "fixture_id": {"type": "string"},
+    "label": {"enum": ["TRUE_POSITIVE", "FALSE_POSITIVE", "EXPECTED", "UNKNOWN"]},
+    "notes": {"type": "string", "maxLength": 2000},
+    "reviewer": {"type": "string", "maxLength": 128},
+    "reviewed_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}
